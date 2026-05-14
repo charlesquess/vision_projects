@@ -1,4 +1,4 @@
-# YOLOv5 修改版 — 4尺度检测头 (P2/P3/P4/P5) 适配 PCB 微小缺陷
+# YOLOv5  — 4尺度检测头 (P2/P3/P4/P5) 适配 PCB 微小缺陷
 
 # Parameters
 nc: 6
@@ -10,7 +10,7 @@ anchors:
   - [30,61, 62,45, 59,119]      # P4/16
   - [116,90, 156,198, 373,326]  # P5/32
 
-# YOLOv5 v6.0 backbone (保持原样)
+# YOLOv5 v6.0 backbone
 backbone:
   [[-1, 1, Conv, [64, 6, 2, 2]],  # 0-P1/2
    [-1, 1, Conv, [128, 3, 2]],  # 1-P2/4
