@@ -1,17 +1,3 @@
-"""
-PCB 数据集预处理 — 滑窗裁剪 + 旋转增强 + YOLO 格式转换
-
-用法:
-  conda run -n yolov5 python scripts/preprocess_dataset.py
-
-流程:
-  1. 遍历 PCB_DATASET 所有图片和 XML 标注
-  2. 固定步长 512 滑窗裁剪 640x640（20% 重叠）
-  3. 边界不足处保留，填充黑色到 640x640
-  4. 以 50% 概率对裁剪块做随机旋转 (-10°~+10°)，标注框同步旋转
-  5. 保存为 YOLO 格式 (images + labels)
-  6. 生成 train/val 划分和 dataset.yaml
-"""
 import random
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -22,13 +8,12 @@ import numpy as np
 PCB_ROOT = Path(__file__).resolve().parent.parent.parent / "PCB_DATASET"
 OUT_ROOT = Path(__file__).resolve().parent.parent / "data" / "yolo_dataset"
 
-CROP_SIZE = 640            # 裁剪尺寸
-STRIDE = 512               # 固定步长 (640 * 0.8 = 20% 重叠)
-ROTATE_PROB = 0.5          # 旋转增强概率
-ROTATE_RANGE = (-10, 10)   # 旋转角度范围 (度)
-
+CROP_SIZE = 640            
+STRIDE = 320               
 VAL_SPLIT = 0.15
 RANDOM_SEED = 42
+
+ENABLE_ORTHOGONAL_AUG = True 
 
 CLASSES = [
     "missing_hole", "mouse_bite", "open_circuit",
@@ -59,7 +44,7 @@ def parse_voc_xml(xml_path: Path):
     return img_w, img_h, objects
 
 
-def sliding_windows_fixed(img_w: int, img_h: int):
+def sliding_windows_fixed(img_w, img_h):
     windows = []
     y = 0
     while y < img_h:
@@ -78,8 +63,9 @@ def crop_and_pad(img, win_x, win_y):
     crop = img[y1:y2, x1:x2]
     actual_h, actual_w = crop.shape[:2]
     if actual_h < CROP_SIZE or actual_w < CROP_SIZE:
-        padded = np.zeros((CROP_SIZE, CROP_SIZE, 3), dtype=np.uint8)
-        padded[:actual_h, :actual_w] = crop
+        pad_b = CROP_SIZE - actual_h
+        pad_r = CROP_SIZE - actual_w
+        padded = cv2.copyMakeBorder(crop, 0, pad_b, 0, pad_r, cv2.BORDER_REFLECT)
         return padded, actual_h, actual_w
     return crop, actual_h, actual_w
 
@@ -91,6 +77,10 @@ def crop_object_in_window(obj, win_x, win_y, crop_h, crop_w):
     ymax = min(obj["ymax"], win_y + crop_h)
     if xmin >= xmax or ymin >= ymax:
         return None
+    orig_area = (obj["xmax"] - obj["xmin"]) * (obj["ymax"] - obj["ymin"])
+    new_area = (xmax - xmin) * (ymax - ymin)
+    if orig_area > 0 and new_area / orig_area < 0.7:
+        return None
     return {
         "class_id": obj["class_id"],
         "xmin": xmin - win_x,
@@ -100,53 +90,26 @@ def crop_object_in_window(obj, win_x, win_y, crop_h, crop_w):
     }
 
 
-def rotate_image_and_boxes(img, boxes, angle):
-    """
-    围绕图像中心旋转 angle 度，保持输出尺寸 640x640。
-    四个角用背景色 (128,128,128) 填充。
-    boxes: list of {class_id, xmin, ymin, xmax, ymax} (坐标在 0~639 范围内)
-    返回 (旋转后图像, 旋转后 boxes)
-    """
+def rotate_orthogonal(img, boxes, angle_code):
+    if angle_code == 0:
+        return img, boxes
+    cv2_rot_map = {1: cv2.ROTATE_90_CLOCKWISE, 2: cv2.ROTATE_180, 3: cv2.ROTATE_90_COUNTERCLOCKWISE}
+    rot_img = cv2.rotate(img, cv2_rot_map[angle_code])
     h, w = img.shape[:2]
-    cx, cy = w / 2.0, h / 2.0
-    M = cv2.getRotationMatrix2D((cx, cy), angle, 1.0)
-    rotated = cv2.warpAffine(img, M, (w, h), borderValue=(128, 128, 128))
-
     new_boxes = []
-    for box in boxes:
-        # 框的四个角
-        corners = np.array([
-            [box["xmin"], box["ymin"]],
-            [box["xmax"], box["ymin"]],
-            [box["xmax"], box["ymax"]],
-            [box["xmin"], box["ymax"]],
-        ], dtype=np.float32)
-
-        # 应用旋转矩阵
-        ones = np.ones((4, 1))
-        corners_h = np.hstack([corners, ones])
-        rotated_corners = (M @ corners_h.T).T
-
-        # 取旋转后外接矩形
-        xs = rotated_corners[:, 0]
-        ys = rotated_corners[:, 1]
-        xmin = max(0, np.clip(xs.min(), 0, w - 1))
-        xmax = min(w, np.clip(xs.max(), 0, w))
-        ymin = max(0, np.clip(ys.min(), 0, h - 1))
-        ymax = min(h, np.clip(ys.max(), 0, h))
-
-        if xmin >= xmax or ymin >= ymax:
-            continue
-
+    for b in boxes:
+        x1, y1, x2, y2 = b["xmin"], b["ymin"], b["xmax"], b["ymax"]
+        if angle_code == 1:
+            nx1, ny1, nx2, ny2 = h - y2, x1, h - y1, x2
+        elif angle_code == 2:
+            nx1, ny1, nx2, ny2 = w - x2, h - y2, w - x1, h - y1
+        else:
+            nx1, ny1, nx2, ny2 = y1, w - x2, y2, w - x1
         new_boxes.append({
-            "class_id": box["class_id"],
-            "xmin": int(round(xmin)),
-            "ymin": int(round(ymin)),
-            "xmax": int(round(xmax)),
-            "ymax": int(round(ymax)),
+            "class_id": b["class_id"],
+            "xmin": nx1, "ymin": ny1, "xmax": nx2, "ymax": ny2
         })
-
-    return rotated, new_boxes
+    return rot_img, new_boxes
 
 
 def to_yolo(rel_obj, img_size):
@@ -159,8 +122,6 @@ def to_yolo(rel_obj, img_size):
 
 def main():
     random.seed(RANDOM_SEED)
-
-    # 收集图片+XML对
     pairs = []
     for xml_path in sorted((PCB_ROOT / "Annotations").rglob("*.xml")):
         rel = xml_path.relative_to(PCB_ROOT / "Annotations").parts
@@ -168,9 +129,6 @@ def main():
         if img_path.exists():
             pairs.append((img_path, xml_path))
 
-    print(f"找到 {len(pairs)} 对 图片+标注")
-
-    # 输出目录
     dirs = {}
     for d in ("images", "labels"):
         for s in ("train", "val"):
@@ -178,60 +136,42 @@ def main():
             p.mkdir(parents=True, exist_ok=True)
             dirs[f"{d}/{s}"] = p
 
-    total_crops = 0
-    crops_with_obj = 0
-    rotated_count = 0
-    records = []
+    total_all = 0
+    total_rot = 0
 
     for img_path, xml_path in pairs:
         img_w, img_h, objects = parse_voc_xml(xml_path)
         windows = sliding_windows_fixed(img_w, img_h)
         img = cv2.imread(str(img_path))
-        if img is None:
-            continue
 
         for (win_x, win_y) in windows:
-            total_crops += 1
-
-            # 裁剪并填充
             crop, ch, cw = crop_and_pad(img, win_x, win_y)
-
-            # 找窗口内的目标
             local_objs = []
             for obj in objects:
                 loc = crop_object_in_window(obj, win_x, win_y, ch, cw)
                 if loc is not None:
                     local_objs.append(loc)
-
             if not local_objs:
                 continue
 
-            crops_with_obj += 1
-            stem = f"{img_path.stem}_x{win_x}y{win_y}"
+            base_stem = f"{img_path.stem}_x{win_x}y{win_y}"
             split = "val" if random.random() < VAL_SPLIT else "train"
+            angles = [0, 1, 2, 3] if (ENABLE_ORTHOGONAL_AUG and split == "train") else [0]
 
-            # 旋转增强（仅训练集）
-            do_rotate = (split == "train" and random.random() < ROTATE_PROB)
-            if do_rotate:
-                angle = random.uniform(*ROTATE_RANGE)
-                crop, local_objs = rotate_image_and_boxes(crop, local_objs, angle)
-                if not local_objs:   # 旋转后所有框都出界，丢弃
-                    continue
-                rotated_count += 1
-                stem += f"_rot{angle:.0f}"
+            for angle in angles:
+                aug_crop, aug_objs = rotate_orthogonal(crop, local_objs, angle)
+                stem = f"{base_stem}_rot{angle*90}"
+                total_all += 1
+                if angle > 0:
+                    total_rot += 1
 
-            cv2.imwrite(str(dirs[f"images/{split}"] / f"{stem}.jpg"), crop)
+                cv2.imwrite(str(dirs[f"images/{split}"] / f"{stem}.jpg"), aug_crop)
+                label_lines = [to_yolo(o, CROP_SIZE) for o in aug_objs]
+                (dirs[f"labels/{split}"] / f"{stem}.txt").write_text("\n".join(label_lines))
 
-            label_lines = [to_yolo(o, CROP_SIZE) for o in local_objs]
-            (dirs[f"labels/{split}"] / f"{stem}.txt").write_text("\n".join(label_lines))
-            records.append((stem, split))
-
-    # dataset.yaml
     nc = len(CLASSES)
     yaml_path = OUT_ROOT / "dataset.yaml"
     yaml_content = (
-        f"# PCB 缺陷检测数据集 (滑窗裁剪 {CROP_SIZE}x{CROP_SIZE}, 步长 {STRIDE}, 重叠 {1-STRIDE/CROP_SIZE:.0%})\n"
-        f"# 旋转增强: 概率 {ROTATE_PROB:.0%}, 范围 {ROTATE_RANGE[0]}~{ROTATE_RANGE[1]} 度\n"
         f"train: {(OUT_ROOT / 'images' / 'train').as_posix()}\n"
         f"val:   {(OUT_ROOT / 'images' / 'val').as_posix()}\n"
         f"\nnc: {nc}\nnames:\n"
@@ -240,21 +180,14 @@ def main():
         yaml_content += f"  {i}: {name}\n"
     yaml_path.write_text(yaml_content)
 
-    train_count = len([r for r in records if r[1] == "train"])
-    val_count = len([r for r in records if r[1] == "val"])
-
     print(f"\n{'='*55}")
     print(f"  裁剪尺寸     : {CROP_SIZE}x{CROP_SIZE}")
-    print(f"  固定步长     : {STRIDE} ({1-STRIDE/CROP_SIZE:.0%} 重叠)")
-    print(f"  边界处理     : 保留 + 填充黑色到 640x640")
-    print(f"  旋转增强     : 概率 {ROTATE_PROB:.0%}, 范围 {ROTATE_RANGE[0]}~{ROTATE_RANGE[1]} 度")
-    print(f"  → 实际旋转   : {rotated_count} 块")
-    print(f"  总裁剪块     : {total_crops}")
-    print(f"  含目标块     : {crops_with_obj}")
-    print(f"  训练集       : {train_count}")
-    print(f"  验证集       : {val_count}")
+    print(f"  固定步长     : {STRIDE} (50% 重叠)")
+    print(f"  边界填充     : BORDER_REFLECT (消除黑边伪影)")
+    print(f"  截断过滤     : 保留面积 < 70% 的框丢弃")
+    print(f"  正交旋转     : 训练集 4 角度 (0/90/180/270)")
+    print(f"  输出总数     : {total_all} (其中旋转: {total_rot})")
     print(f"  输出目录     : {OUT_ROOT}")
-    print(f"  标签文件     : {yaml_path}")
     print(f"{'='*55}")
 
 

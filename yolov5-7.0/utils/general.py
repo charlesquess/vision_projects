@@ -1002,6 +1002,7 @@ def non_max_suppression(
 
 def strip_optimizer(f='best.pt', s=''):  # from utils.general import *; strip_optimizer()
     # Strip optimizer from 'f' to finalize training, optionally save as 's'
+    import numpy
     from torch.serialization import add_safe_globals
     add_safe_globals([numpy.core.multiarray._reconstruct])
     x = torch.load(f, map_location=torch.device('cpu'))
