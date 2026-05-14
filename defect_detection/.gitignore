@@ -1,0 +1,36 @@
+# Build
+build/
+cmake-build-*/
+*.o
+*.obj
+*.exe
+*.lib
+*.dll
+*.so
+*.dylib
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data
+data/
+logs/*.log
+logs/stats*
+
+# Models
+models/*.onnx
+models/*.pt
+models/*.engine
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
